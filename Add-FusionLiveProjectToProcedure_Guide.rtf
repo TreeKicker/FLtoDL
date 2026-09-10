@@ -79,14 +79,14 @@ Edit the configuration block, then run:\par
 The script performs these operations in order:\par
 1. Connects to SQL Server with Invoke-Sqlcmd.\par
 2. Executes OBJECT_DEFINITION(OBJECT_ID(...)) to retrieve dbo.raw_loading_documents_metadata.\par
-3. Saves the downloaded procedure definition as a timestamped database backup.\par
-4. Parses the downloaded procedure in memory.\par
+3. Saves the downloaded procedure definition to a timestamped working copy.\par
+4. Parses that downloaded working copy.\par
 5. Detects whether WorkSpaceId already exists.\par
 6. Adds a WHEN branch or creates a new ELSE IF block.\par
-7. Executes the edited definition as ALTER PROCEDURE.\par
-8. Updates the local SQL file only after the ALTER succeeds.\par
+7. Writes the project update to the timestamped working copy.\par
+8. Executes the edited working copy as ALTER PROCEDURE, last.\par
 \par
-This ordering prevents a failed SQL deployment from making the local file appear newer than the database.\par
+The original local SQL file is not changed in database-synchronized mode.\par
 \par
 \b 6. Existing workspace behavior\b0\par
 If WorkSpaceId 16756 already exists, the script finds its CASE expression and inserts a new branch immediately before the CASE ELSE line:\par
@@ -126,9 +126,9 @@ The script writes changes immediately when it reaches the update operation. Ther
 \b 11. Backup behavior\b0\par
 In database-synchronized mode, the backup is downloaded from SQL Server before the procedure is edited. The default name resembles:\par
 \f1\fs20
-raw_loading_documents_metadata_upd.sql.database_backup.20260910_143000.sql\n\f0\fs22
+raw_loading_documents_metadata_upd_2026-09-10_14-30-00.sql\n\f0\fs22
 \par
-This backup contains the deployed procedure definition that existed immediately before the change. It is the preferred rollback source for synchronized changes.\par
+The timestamped file starts with the deployed procedure definition and is then used as the working copy for the synchronized change.\par
 \par
 In file-only mode, the backup is copied from the local procedure script and has a file_backup suffix.\par
 \par
@@ -143,7 +143,7 @@ ALTER PROCEDURE\n\f0\fs22
 \par
 The temporary file is passed to Invoke-Sqlcmd, which understands GO batch separators if they are present. The temporary file is removed in a finally block whether deployment succeeds or fails.\par
 \par
-The local file is written as CREATE OR ALTER PROCEDURE after synchronization, making it rerunnable in SSMS without manually switching between CREATE and ALTER.\par
+The timestamped working copy is passed directly to deployment after its CREATE declaration is converted to ALTER.\par
 \par
 \b 14. Authentication\b0\par
 Invoke-Sqlcmd uses the current Windows credentials by default. The account must have:\par
@@ -162,7 +162,7 @@ Search the output for the new mapping:\par
 \f1\fs20
 WHEN FolderName LIKE '%10715.600%' THEN '10715.600'\n\f0\fs22
 \par
-Then verify the local file contains the same mapping and has a CREATE OR ALTER PROCEDURE declaration.\par
+Then verify the timestamped working copy contains the same mapping.\par
 \par
 For a new workspace, search for:\par
 \f1\fs20
@@ -173,9 +173,9 @@ Finally, run the normal FusionLive process for the affected workspace and inspec
 SELECT WorkSpaceId, FolderName, ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\n  AND FolderName LIKE '%10715.600%';\n\f0\fs22
 \par
 \b 16. Rollback\b0\par
-If the change is incorrect, use the downloaded database backup to restore the prior procedure definition. The backup may contain CREATE PROCEDURE, so change it to ALTER PROCEDURE before executing it against a procedure that already exists, or run it through the same temporary ALTER conversion used by the PowerShell script.\par
+If the change is incorrect, restore the prior procedure definition from another source or capture the deployed definition before rerunning. The timestamped working copy may contain the new mapping after the update.\par
 \par
-Before rollback, confirm the backup is the correct timestamped file and review its contents. Do not blindly execute an unknown SQL file against production.\par
+Review the timestamped working copy before executing it against production. Do not blindly execute an unknown SQL file against production.\par
 \par
 \b 17. Common errors\b0\par
 \b Invoke-Sqlcmd was not found:\b0 Install or import the SqlServer PowerShell module.\par
@@ -183,7 +183,7 @@ Before rollback, confirm the backup is the correct timestamped file and review i
 \b Procedure was not found:\b0 Confirm the procedure exists as dbo.raw_loading_documents_metadata in the selected database.\par
 \b No @WorkSpaceId sections found:\b0 The downloaded definition or local file is not in the expected IF / ELSE IF format.\par
 \b Project already exists:\b0 The script stops intentionally to prevent duplicate WHEN branches.\par
-\b SQL ALTER fails:\b0 The local file is not updated in SyncWithDatabase mode until SQL Server accepts the temporary ALTER script. Review the error and the downloaded backup.\par
+\b SQL ALTER fails:\b0 The timestamped working copy contains the edited definition. Review it before rerunning the script.\par
 \b Shared staging interference:\b0 Avoid running concurrent instances because the stored procedure truncates shared staging tables.\par
 \par
 \b 18. Recommended standard configuration\b0\par
@@ -191,8 +191,8 @@ For normal production maintenance, set the database synchronization values in th
 \f1\fs20
 $ServerInstance = 'YourSqlServer'\n$SyncWithDatabase = $true\n\f0\fs22
 \par
-Then run the script. It starts from the deployed SQL Server definition, creates a rollback copy, alters the database procedure, and synchronizes the local SQL script after success.\par
+Then run the script. It starts from the deployed SQL Server definition, writes a timestamped working copy, applies the mapping to that copy, and alters the database procedure from it as the final operation.\par
 \par
 \b Summary\b0\par
-The key distinction is source of truth. File-only mode starts from the local SQL file. SyncWithDatabase mode starts from SQL Server, backs up that deployed definition, applies the new project mapping to it, deploys the ALTER PROCEDURE, and then updates the local script.\par
+The key distinction is source of truth. File-only mode starts from the local SQL file. SyncWithDatabase mode starts from SQL Server, downloads a timestamped working copy, applies the new project mapping to it, and deploys the ALTER PROCEDURE from that copy last.\par
 }

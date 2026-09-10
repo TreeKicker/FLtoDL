@@ -101,20 +101,10 @@ function Complete-ProcedureUpdate {
     )
 
     if ($SyncWithDatabase) {
-        # Deploy the edited definition first. The local script is changed only
-        # after SQL Server accepts the ALTER PROCEDURE batch.
-        $executionFile = Join-Path $env:TEMP ("raw_loading_documents_metadata_upd_{0}.sql" -f ([guid]::NewGuid().ToString('N')))
-        try {
-            Set-Content -LiteralPath $executionFile -Value $EditedLines -Encoding ASCII
-            Publish-ProcedureToDatabase -SqlFilePath $executionFile -TargetServer $ServerInstance -TargetDatabase $Database
-
-            # Keep the local source deployable on its own after synchronization.
-            $localSql = ($EditedLines -join "`r`n") -replace '(?im)^\s*CREATE\s+PROCEDURE\b', 'CREATE OR ALTER PROCEDURE'
-            Set-Content -LiteralPath $resolvedProcedurePath -Value $localSql -Encoding ASCII
-        }
-        finally {
-            Remove-Item -LiteralPath $executionFile -Force -ErrorAction SilentlyContinue
-        }
+        # The downloaded copy is the working file. Write all project changes
+        # to it before using it for the final database ALTER.
+        Set-Content -LiteralPath $BackupPath -Value $EditedLines -Encoding ASCII
+        Publish-ProcedureToDatabase -SqlFilePath $BackupPath -TargetServer $ServerInstance -TargetDatabase $Database
     }
     else {
         # File-only mode retains the original behavior: back up and write the
@@ -129,8 +119,8 @@ function Complete-ProcedureUpdate {
 }
 
 if ($SyncWithDatabase) {
-    # Download the deployed procedure before making any changes. This is the
-    # authoritative rollback copy requested for database-synchronized edits.
+    # Download the deployed procedure before making any changes. The resulting
+    # timestamped file becomes the working copy for the project update.
     $databaseDefinition = Get-ProcedureDefinitionFromDatabase -TargetServer $ServerInstance -TargetDatabase $Database
     $lines = [System.Collections.Generic.List[string]]($databaseDefinition -split "`r?`n")
 }
@@ -141,14 +131,20 @@ else {
 if ([string]::IsNullOrWhiteSpace($BackupPath)) {
     # Keep the backup beside the edited procedure and make each default backup
     # unique to the second in which the change is made.
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
     $suffix = if ($SyncWithDatabase) { 'database_backup' } else { 'file_backup' }
-    $BackupPath = "$resolvedProcedurePath.$suffix.$timestamp.sql"
+    $BackupPath = if ($SyncWithDatabase) {
+        Join-Path (Split-Path -Parent $resolvedProcedurePath) ("raw_loading_documents_metadata_upd_{0}.sql" -f $timestamp)
+    }
+    else {
+        "$resolvedProcedurePath.$suffix.$timestamp.sql"
+    }
 }
 
 # In database-sync mode, save the downloaded SQL definition as the backup before
 # editing it. In file-only mode, preserve the existing file backup behavior.
 if ($SyncWithDatabase) {
+    # Save the database definition before any project mapping is changed.
     Set-Content -LiteralPath $BackupPath -Value $lines -Encoding ASCII
 }
 
