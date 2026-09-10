@@ -1,0 +1,215 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Calibri;}{\f1 Consolas;}}
+{\colortbl;\red31\green78\blue121;}
+\paperw12240\paperh15840\margl1080\margr1080\margt900\margb900
+\fs22
+\cf1\b\fs36 Add-FusionLiveProjectToProcedure.ps1\cf0\b0\fs22\par
+\i Detailed user guide for adding FusionLive project mappings\i0\par
+\par
+\b 1. Purpose\b0\par
+Add-FusionLiveProjectToProcedure.ps1 automates the manual edit normally required when a new FusionLive project is discovered. It can add a project mapping to an existing @WorkSpaceId section or create a complete new workspace section when the workspace is not already present.\par
+\par
+The script supports two operating modes:\par
+\b File-only mode:\b0 Reads and edits the local SQL script. This is the default behavior.\par
+\b Database-synchronized mode:\b0 Downloads the current stored procedure from SQL Server, saves that downloaded definition as a backup, alters the procedure in SQL Server, and updates the local SQL file only after the database change succeeds.\par
+\par
+\b 2. Important object names\b0\par
+The script targets this SQL Server procedure:\par
+\f1\fs20 dbo.raw_loading_documents_metadata\n\f0\fs22
+The local script normally contains:\par
+\f1\fs20
+raw_loading_documents_metadata_upd.sql\n\f0\fs22
+The target database defaults to FLDataMart.\par
+\par
+\b 3. Prerequisites\b0\par
+Before using database options, confirm:\par
+1. The SQL Server name is known.\par
+2. The executing Windows account has permission to read and alter the procedure.\par
+3. The SqlServer PowerShell module is installed and Invoke-Sqlcmd is available.\par
+4. The local procedure file is the file you intend to maintain.\par
+5. The XML loading process is not running concurrently because the procedure uses shared staging tables.\par
+\par
+Check for Invoke-Sqlcmd:\par
+\f1\fs20
+Get-Command Invoke-Sqlcmd\n\f0\fs22
+\par
+If PowerShell cannot find it, install or import the SqlServer module according to your organization's approved software process.\par
+\par
+\b 4. Parameters\b0\par
+\b ProcedurePath\b0\par
+Required. The local SQL procedure script to edit.\par
+\f1\fs20
+-ProcedurePath .\\raw_loading_documents_metadata_upd.sql\n\f0\fs22
+\par
+\b WorkSpaceId\b0\par
+Required. The FusionLive workspace that owns the project.\par
+\f1\fs20
+-WorkSpaceId 16756\n\f0\fs22
+\par
+\b ProjectNumber\b0\par
+Required. The project number to add. The script rejects SQL LIKE wildcard characters in this parameter because the project number itself should be a literal value.\par
+\f1\fs20
+-ProjectNumber '10715.600'\n\f0\fs22
+\par
+\b FolderPattern\b0\par
+Optional. The complete SQL LIKE pattern used in the generated WHEN clause. If omitted, the script automatically creates:\par
+\f1\fs20
+%10715.600%\n\f0\fs22
+\par
+Use this parameter when an existing procedure rule matches a descriptive folder name instead of the project number:\par
+\f1\fs20
+-FolderPattern '%Special Drawing Management%'\n\f0\fs22
+\par
+\b BackupPath\b0\par
+Optional. The path for the backup. If omitted, the script creates a timestamped SQL backup beside the local procedure file.\par
+\par
+\b ServerInstance\b0\par
+Required when using -ApplyToDatabase or -SyncWithDatabase. This is the SQL Server instance name, for example:\par
+\f1\fs20
+-ServerInstance 'IMSQL19'\n\f0\fs22
+\par
+\b Database\b0\par
+Optional. Defaults to FLDataMart.\par
+\f1\fs20
+-Database 'FLDataMart'\n\f0\fs22
+\par
+\b ApplyToDatabase\b0\par
+Optional switch. Uses the local SQL file as the source, updates the local file, then executes an ALTER PROCEDURE version against SQL Server.\par
+\par
+\b SyncWithDatabase\b0\par
+Optional switch. Downloads the current deployed procedure from SQL Server first. This is the recommended mode when SQL Server is the source of truth.\par
+\par
+\b 5. Recommended database-synchronized workflow\b0\par
+Use this mode when you want the current SQL Server procedure downloaded as the backup before making any edit.\par
+\f1\fs20
+.\\Add-FusionLiveProjectToProcedure.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -WorkSpaceId 16756 `\n    -ProjectNumber '10715.600' `\n    -ServerInstance 'YourSqlServer' `\n    -Database 'FLDataMart' `\n    -SyncWithDatabase\n\f0\fs22
+\par
+The script performs these operations in order:\par
+1. Connects to SQL Server with Invoke-Sqlcmd.\par
+2. Executes OBJECT_DEFINITION(OBJECT_ID(...)) to retrieve dbo.raw_loading_documents_metadata.\par
+3. Saves the downloaded procedure definition as a timestamped database backup.\par
+4. Parses the downloaded procedure in memory.\par
+5. Detects whether WorkSpaceId already exists.\par
+6. Adds a WHEN branch or creates a new ELSE IF block.\par
+7. Executes the edited definition as ALTER PROCEDURE.\par
+8. Updates the local SQL file only after the ALTER succeeds.\par
+\par
+This ordering prevents a failed SQL deployment from making the local file appear newer than the database.\par
+\par
+\b 6. Existing workspace behavior\b0\par
+If WorkSpaceId 16756 already exists, the script finds its CASE expression and inserts a new branch immediately before the CASE ELSE line:\par
+\f1\fs20
+WHEN FolderName LIKE '%10715.600%' THEN '10715.600'\n\f0\fs22
+\par
+The existing ELSE behavior is preserved. For example, if the workspace currently ends with ELSE NULL END, the new branch is inserted before it.\par
+\par
+The script checks whether the project number is already present in that workspace. If it is already present, the script stops without modifying the file or database.\par
+\par
+\b 7. New workspace behavior\b0\par
+If the WorkSpaceId is not found, the script creates a complete section before the final dim_rpt_project fallback:\par
+\f1\fs20
+ELSE IF @WorkSpaceId = 12345\n\tBEGIN\n\t\tUPDATE dbo.raw_fusionLive_documents_metadata\n\t\tSET ProjectNumber = CASE\n\t\t\t\tWHEN FolderName LIKE '%10315.500%' THEN '10315.500'\n\t\t\t\tELSE NULL END\n\t\tWHERE WorkSpaceId = @WorkSpaceId;\n\tEND\n\f0\fs22
+\par
+The script identifies the fallback by looking for a standalone ELSE followed by BEGIN and a nearby dim_rpt_project reference. This avoids confusing the workspace CASE ELSE lines with the final procedure fallback.\par
+\par
+\b 8. File-only mode\b0\par
+If you do not specify -SyncWithDatabase or -ApplyToDatabase, only the local SQL script is edited:\par
+\f1\fs20
+.\\Add-FusionLiveProjectToProcedure.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -WorkSpaceId 16756 `\n    -ProjectNumber '10715.600'\n\f0\fs22
+\par
+Before writing, the script creates a timestamped file backup. It does not connect to SQL Server and does not update the deployed procedure.\par
+\par
+\b 9. Apply local SQL to the database\b0\par
+Use -ApplyToDatabase when the local file should be the source of the change:\par
+\f1\fs20
+.\\Add-FusionLiveProjectToProcedure.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -WorkSpaceId 16756 `\n    -ProjectNumber '10715.600' `\n    -ServerInstance 'YourSqlServer' `\n    -Database 'FLDataMart' `\n    -ApplyToDatabase\n\f0\fs22
+\par
+This path backs up the local file, writes the new mapping to it, creates a temporary SQL script that changes CREATE PROCEDURE to ALTER PROCEDURE, and executes that temporary script with Invoke-Sqlcmd.\par
+\par
+Use -SyncWithDatabase instead when the deployed database copy should be downloaded first.\par
+\par
+\b 10. Preview with WhatIf\b0\par
+The script supports PowerShell ShouldProcess. Use -WhatIf to preview without changing the local file, creating a file backup, or deploying an ALTER statement:\par
+\f1\fs20
+.\\Add-FusionLiveProjectToProcedure.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -WorkSpaceId 16756 `\n    -ProjectNumber '10715.600' `\n    -WhatIf\n\f0\fs22
+\par
+When using -SyncWithDatabase -WhatIf, the script still needs to read the current database definition so it can inspect the real procedure structure. The actual edit, backup write, ALTER execution, and local write are skipped by ShouldProcess.\par
+\par
+\b 11. Confirm prompts\b0\par
+Use -Confirm when you want PowerShell to ask before performing the edit or database operation:\par
+\f1\fs20
+.\\Add-FusionLiveProjectToProcedure.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -WorkSpaceId 16756 `\n    -ProjectNumber '10715.600' `\n    -ServerInstance 'YourSqlServer' `\n    -SyncWithDatabase `\n    -Confirm\n\f0\fs22
+\par
+\b 12. Backup behavior\b0\par
+In database-synchronized mode, the backup is downloaded from SQL Server before the procedure is edited. The default name resembles:\par
+\f1\fs20
+raw_loading_documents_metadata_upd.sql.database_backup.20260910_143000.sql\n\f0\fs22
+\par
+This backup contains the deployed procedure definition that existed immediately before the change. It is the preferred rollback source for synchronized changes.\par
+\par
+In file-only mode, the backup is copied from the local procedure script and has a file_backup suffix.\par
+\par
+You can choose an explicit backup path:\par
+\f1\fs20
+-BackupPath 'C:\\Backups\\raw_loading_documents_metadata_before_10715_600.sql'\n\f0\fs22
+\par
+\b 13. How the SQL deployment works\b0\par
+The database definition normally contains CREATE PROCEDURE. SQL Server will reject CREATE PROCEDURE when the procedure already exists, so the script creates a temporary execution copy and changes the first procedure declaration to:\par
+\f1\fs20
+ALTER PROCEDURE\n\f0\fs22
+\par
+The temporary file is passed to Invoke-Sqlcmd, which understands GO batch separators if they are present. The temporary file is removed in a finally block whether deployment succeeds or fails.\par
+\par
+The local file is written as CREATE OR ALTER PROCEDURE after synchronization, making it rerunnable in SSMS without manually switching between CREATE and ALTER.\par
+\par
+\b 14. Authentication\b0\par
+Invoke-Sqlcmd uses the current Windows credentials by default. The account must have:\par
+- Permission to read the procedure definition.\par
+- Permission to ALTER dbo.raw_loading_documents_metadata.\par
+- Access to the FLDataMart database.\par
+\par
+Do not put passwords in this script or pass them through source-controlled command lines. Use your organization's approved SQL authentication method if Windows authentication is not appropriate.\par
+\par
+\b 15. Validation after a synchronized change\b0\par
+After the command completes, verify the procedure definition in SQL Server:\par
+\f1\fs20
+SELECT OBJECT_DEFINITION(OBJECT_ID(N'dbo.raw_loading_documents_metadata')) AS ProcedureDefinition;\n\f0\fs22
+\par
+Search the output for the new mapping:\par
+\f1\fs20
+WHEN FolderName LIKE '%10715.600%' THEN '10715.600'\n\f0\fs22
+\par
+Then verify the local file contains the same mapping and has a CREATE OR ALTER PROCEDURE declaration.\par
+\par
+For a new workspace, search for:\par
+\f1\fs20
+ELSE IF @WorkSpaceId = 12345\n\f0\fs22
+\par
+Finally, run the normal FusionLive process for the affected workspace and inspect ProjectNumber results:\par
+\f1\fs20
+SELECT WorkSpaceId, FolderName, ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\n  AND FolderName LIKE '%10715.600%';\n\f0\fs22
+\par
+\b 16. Rollback\b0\par
+If the change is incorrect, use the downloaded database backup to restore the prior procedure definition. The backup may contain CREATE PROCEDURE, so change it to ALTER PROCEDURE before executing it against a procedure that already exists, or run it through the same temporary ALTER conversion used by the PowerShell script.\par
+\par
+Before rollback, confirm the backup is the correct timestamped file and review its contents. Do not blindly execute an unknown SQL file against production.\par
+\par
+\b 17. Common errors\b0\par
+\b Invoke-Sqlcmd was not found:\b0 Install or import the SqlServer PowerShell module.\par
+\b ServerInstance is required:\b0 Supply -ServerInstance whenever using -ApplyToDatabase or -SyncWithDatabase.\par
+\b Procedure was not found:\b0 Confirm the procedure exists as dbo.raw_loading_documents_metadata in the selected database.\par
+\b No @WorkSpaceId sections found:\b0 The downloaded definition or local file is not in the expected IF / ELSE IF format.\par
+\b Project already exists:\b0 The script stops intentionally to prevent duplicate WHEN branches.\par
+\b SQL ALTER fails:\b0 The local file is not updated in SyncWithDatabase mode until SQL Server accepts the temporary ALTER script. Review the error and the downloaded backup.\par
+\b Shared staging interference:\b0 Avoid running concurrent instances because the stored procedure truncates shared staging tables.\par
+\par
+\b 18. Recommended standard command\b0\par
+For normal production maintenance, use database synchronization:\par
+\f1\fs20
+.\\Add-FusionLiveProjectToProcedure.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -WorkSpaceId 16756 `\n    -ProjectNumber '10715.600' `\n    -ServerInstance 'YourSqlServer' `\n    -Database 'FLDataMart' `\n    -SyncWithDatabase `\n    -Confirm\n\f0\fs22
+\par
+This command starts from the deployed SQL Server definition, creates a rollback copy, alters the database procedure, and synchronizes the local SQL script after success.\par
+\par
+\b Summary\b0\par
+The key distinction is source of truth. File-only mode starts from the local SQL file. SyncWithDatabase mode starts from SQL Server, backs up that deployed definition, applies the new project mapping to it, deploys the ALTER PROCEDURE, and then updates the local script.\par
+}

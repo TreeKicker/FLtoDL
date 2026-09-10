@@ -1,0 +1,260 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Calibri;}{\f1 Consolas;}}
+{\colortbl;\red31\green78\blue121;\red80\green80\blue80;}
+\paperw12240\paperh15840\margl1080\margr1080\margt900\margb900
+\fs22
+\cf1\b\fs36 Understanding raw_loading_documents_metadata_upd.sql\cf0\b0\fs22\par
+\i Detailed guide to the current FusionLive XML loading procedure\i0\par
+\par
+\b Document scope\b0\par
+This document explains the current production stored procedure dbo.raw_loading_documents_metadata_upd in database FLDataMart. It describes what each major section does, how data moves through the staging tables, how the XML-like export is parsed, how metadata attributes are assigned, how deleted records are handled, and how ProjectNumber is determined.\par
+\par
+The procedure currently uses hard-coded IF / ELSE IF blocks for project mappings. The procedure described here is the original process; it does not depend on the newer mapping-table test process.\par
+\par
+\b 1. Procedure purpose\b0\par
+The procedure receives two parameters:\par
+\f1\fs20
+@WorkSpaceId INT\n@FilePath VARCHAR(200)\n\f0\fs22
+\par
+@WorkSpaceId identifies the FusionLive workspace being loaded. @FilePath identifies the text file containing the XML export. The procedure bulk-loads that file, parses the document records and related XML elements, writes the results to the production metadata table, assigns project numbers, and records a refresh log entry.\par
+\par
+A typical execution looks like this:\par
+\f1\fs20
+EXEC dbo.raw_loading_documents_metadata_upd\n    16756,\n    '\\\\IMSQL19.EDG.NET\\SourceData\\FusionLive\\16756.txt';\n\f0\fs22
+\par
+The file path must be accessible to the SQL Server service account, not merely to the person running SSMS.\par
+\par
+\b 2. Session settings and variables\b0\par
+The procedure sets QUOTED_IDENTIFIER OFF and NOCOUNT ON near the beginning. NOCOUNT suppresses row-count messages while the procedure performs many INSERT and UPDATE statements. This reduces message traffic for callers such as PowerShell or SQL Agent.\par
+\par
+The first declared variables are:\par
+\f1\fs20
+DECLARE @BulkInsert VARCHAR(200), @Last_Updated DATETIME;\n\f0\fs22
+\par
+@BulkInsert holds dynamically constructed BULK INSERT text. @Last_Updated captures the latest known update time for the workspace. In the current procedure, @Last_Updated is calculated but the incremental filtering that would use it is commented out. Therefore, the current run reloads the workspace records rather than processing only records newer than that timestamp.\par
+\par
+\b 3. Last-update lookup\b0\par
+The procedure calculates the last timestamp from raw_fusionLive_documents_metadata:\par
+\f1\fs20
+SELECT @Last_Updated = ISNULL(MAX(ISNULL(last_updated_time, uploaded)), '01/01/2020')\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = @WorkSpaceId;\n\f0\fs22
+\par
+The inner ISNULL chooses last_updated_time when present and uploaded when it is not. The outer ISNULL supplies January 1, 2020 when no prior records exist. This value is currently retained for historical or future incremental-loading logic, but it does not restrict the active INSERT statements because the relevant WHERE conditions are commented out.\par
+\par
+\b 4. Bulk loading the source file\b0\par
+The procedure clears the raw employee staging table, builds a BULK INSERT command, and executes it dynamically:\par
+\f1\fs20
+TRUNCATE TABLE dbo.fl_raw_export_emp;\nSELECT @BulkInsert = 'BULK INSERT dbo.v_fl_raw_export_emp FROM "' + @FilePath + '"';\nEXEC(@BulkInsert);\n\f0\fs22
+\par
+The source file is loaded through dbo.v_fl_raw_export_emp. Although the object name begins with v_, it is used as the BULK INSERT destination in the procedure. The actual table or view definition is outside this script and should be checked in the database when troubleshooting data types or bulk-load errors.\par
+\par
+Dynamic SQL is used because BULK INSERT requires the file path in the command. The current code concatenates @FilePath directly into the command. The caller should therefore control and validate the path value.\par
+\par
+\b 5. Filtering XML wrapper rows\b0\par
+The procedure truncates dbo.fl_raw_export_table and copies rows from the employee staging object. It excludes XML wrapper elements such as <?xml, status, workspace, documents, and attributes tags.\par
+\f1\fs20
+TRUNCATE TABLE dbo.fl_raw_export_table;\nINSERT INTO dbo.fl_raw_export_table (TransId, LineText)\nSELECT TransId, LineText\nFROM dbo.fl_raw_export_emp\nWHERE LineText NOT LIKE '<?xml%'\n  AND LineText NOT LIKE '<status%'\n  AND LineText NOT LIKE '</status%'\n  AND LineText NOT LIKE '<workspace%'\n  AND LineText NOT LIKE '<documents%'\n  AND LineText NOT LIKE '</documents%'\n  AND LineText NOT IN ('<attributes>', '</attributes>')\nORDER BY 1;\n\f0\fs22
+\par
+This creates a working row-by-row representation of the export. TransId preserves the source order, which is important because later logic associates a document start row with following folder, category, file, and attribute rows.\par
+\par
+\b 6. Document header normalization\b0\par
+Document header rows initially resemble XML such as:\par
+\f1\fs20
+<document id="10398912" reference="2200-EL-DWG-5750-EXV-0003" title="Vendor Test Document 3" ...>\n\f0\fs22
+\par
+The procedure identifies rows beginning with <document id=, extracts the numeric document ID into FLID, and replaces the beginning of the row with the portion beginning at reference=.\par
+\f1\fs20
+UPDATE dbo.fl_raw_export_table\nSET FLID = CAST(... AS BIGINT),\n    LineText = RIGHT(LineText, LEN(LineText) - CHARINDEX('reference=', LineText, 1) + 1)\nWHERE LineText LIKE '<document id="%';\n\f0\fs22
+\par
+FLID is the FusionLive document identifier. It is later copied onto all rows belonging to that document.\par
+\par
+The next series of UPDATE statements replaces XML attribute boundaries with pipe delimiters. For example, the row is transformed conceptually into:\par
+\f1\fs20
+reference=|2200-EL-DWG-5750-EXV-0003| title=|Vendor Test Document 3| revision=|A| status=|Issue for Review| ...\n\f0\fs22
+\par
+The parser later uses CHARINDEX and SUBSTRING to read values between delimiters. This is a custom text parser rather than SQL Server XML parsing. It depends on the expected attribute order and spelling remaining stable.\par
+\par
+\b 7. Vendor Reference Number cleanup\b0\par
+FusionLive can place a Vendor Reference Number value on a separate physical row. The cursor c_VendorReferenceNumber finds a value row immediately after an attribute row whose name is Vendor Reference Number. It removes line-feed, carriage-return, and non-breaking-space characters from the parent row, appends the child text, updates the parent row, and deletes the child row.\par
+\f1\fs20
+DECLARE c_VendorReferenceNumber INSENSITIVE CURSOR FOR\nSELECT ...\nFROM dbo.fl_raw_export_table a\nINNER JOIN dbo.fl_raw_export_table b\n    ON a.TransId - 1 = b.TransId\nWHERE a.LineText NOT LIKE '<%'\n  AND b.LineText LIKE '<attribute name="Vendor Reference Number"%';\n\f0\fs22
+\par
+This is necessary because the procedure expects a complete value on one row when it later processes Vendor Reference Number.\par
+\par
+\b 8. Assigning FLID to child rows\b0\par
+The cursor c_update_flid scans every document-start row where FLID is populated. For each start row, it finds the next row containing </document>. Every row between the start and end receives the same FLID.\par
+\f1\fs20
+SELECT @max_TransId = MIN(TransId)\nFROM dbo.fl_raw_export_table\nWHERE TransId > @TransId\n  AND LineText = '</document>';\n\nUPDATE dbo.fl_raw_export_table\nSET FLID = @FLID\nWHERE TransId > @TransId\n  AND TransId <= @max_TransId;\n\f0\fs22
+\par
+This creates the relationship between a document and its related folder, category, file, and attribute rows. If the export contains malformed or missing closing document tags, the child assignment can be incomplete.\par
+\par
+\b 9. Loading the temporary metadata table\b0\par
+The procedure truncates raw_fusionLive_documents_metadata_temp before parsing document headers. It then opens cursor c_parse_element over rows beginning with reference=|.\par
+\par
+For each document row, the procedure resets approximately thirty variables to NULL. It extracts values for reference, title, revision, status, version, boolean flags, company information, dates, file size, update information, URI, and rendition flags.\par
+\par
+Examples of extracted values include:\par
+\f1\fs20
+SELECT @reference = SUBSTRING(...);\nSELECT @title = SUBSTRING(...);\nSELECT @revision = SUBSTRING(...);\nSELECT @status = SUBSTRING(...);\nSELECT @uploaded = SUBSTRING(...);\n\f0\fs22
+\par
+Optional values such as lockedbyid, lockedbyname, and hasrendition are protected with CASE expressions that first check whether the delimiter exists. This prevents some substring calculations from failing when optional XML attributes are absent.\par
+\par
+The parsed values are inserted into raw_fusionLive_documents_metadata_temp with WorkSpaceId and the FLID extracted from the document header. Empty external URLs and special 1900 date values are converted to NULL. File size is converted to BIGINT. Revision spaces are removed with REPLACE(@revision, ' ', '').\par
+\par
+\b 10. Folder processing\b0\par
+The cursor c_update_folderid finds rows beginning with <folder id. It extracts the folder ID and folder name, then updates all temporary metadata rows with the matching document FLID.\par
+\f1\fs20
+UPDATE dbo.raw_fusionLive_documents_metadata_temp\nSET FolderID = @FolderID,\n    FolderName = @FolderName\nWHERE id = @FLID;\n\f0\fs22
+\par
+FolderName is the key input used later for ProjectNumber assignment. The exact folder text and path structure determine which project mapping CASE branch matches.\par
+\par
+\b 11. Category processing\b0\par
+The cursor c_update_category finds <category id rows, extracts category_id and category_name, and updates the temporary metadata row associated with the document FLID. The current code checks IF @FolderID IS NOT NULL before updating, although the cursor is processing category data. That condition is part of the existing procedure behavior and should be reviewed carefully before changing.\par
+\par
+\b 12. File type processing\b0\par
+File rows are normalized in the same delimiter style used for document headers. The procedure replaces boundaries for type, mimetype, name, size, and contentformatcode. It then parses each file row in a cursor and updates the matching temporary document.\par
+\par
+The content format is normalized for two values:\par
+\f1\fs20
+CASE @file_contentformatcode\n    WHEN 'text' THEN 'txt'\n    WHEN 'excel8book' THEN 'xls'\n    ELSE @file_contentformatcode\nEND\n\f0\fs22
+\par
+File size is converted to BIGINT and file name, MIME type, file type, and content format are stored in the temporary metadata row.\par
+\par
+\b 13. Deleted-record flag\b0\par
+Rows whose FolderName contains TRASH are marked deleted, except rows containing Trash Compactor:\par
+\f1\fs20
+UPDATE dbo.raw_fusionLive_documents_metadata_temp\nSET isDeleted = 1\nWHERE FolderName LIKE '%TRASH%'\n  AND ISNULL(FolderName, '') NOT LIKE '%Trash Compactor%';\n\f0\fs22
+\par
+This is a business rule. The Trash Compactor exception prevents those records from being treated as deleted.\par
+\par
+\b 14. Attribute extraction\b0\par
+The procedure contains many UPDATE statements that read rows from fl_raw_export_table and write values into raw_fusionLive_documents_metadata_temp. Each statement joins on FLID so the attribute is applied to the correct document.\par
+\par
+Simple text attributes use value= and the closing XML marker:\par
+\f1\fs20
+UPDATE d\nSET d.Tag = CASE LEN(SUBSTRING(f.LineText, ...))\n    WHEN 0 THEN NULL\n    ELSE SUBSTRING(f.LineText, ...)\nEND\nFROM dbo.raw_fusionLive_documents_metadata_temp d\nINNER JOIN dbo.fl_raw_export_table f ON d.id = f.FLID\nWHERE f.LineText LIKE '<attribute name="Tag"%';\n\f0\fs22
+\par
+Date-like attributes use the same extraction pattern and rely on the destination column to store or interpret the text. Examples include Revision Date, Planned Submission Date, Actual Return Date, Due Date, and Created.\par
+\par
+Several coded attributes have two possible XML formats: one with a code attribute and one without it. For Phase, Document Type, Originator, Discipline, Scope group, Criticality, Reason For Issue, Client Decision Code, CTR, Facility, Contract, FacilityArch, and ABS Stamped, IF EXISTS checks whether the code form is present. The procedure then chooses either the value-to-code delimiter or the value-to-closing-tag delimiter.\par
+\par
+PO is handled separately. When the XML has empty value and code attributes, PO Number is set to NULL. Otherwise, the code attribute is used for PO Number.\par
+\par
+VDR Code has an important naming detail: the XML attribute named VDR Code is written into the destination column [DRS Number] in one section. Later, a separate VDR Code section writes to [VDR Code]. This should be understood before changing either mapping.\par
+\par
+\b 15. FusionLive URL creation\b0\par
+After attributes are loaded, the procedure creates a FusionLive viewer URL from the document ID. It skips records whose PM_Status is Pre-register:\par
+\f1\fs20
+UPDATE dbo.raw_fusionLive_documents_metadata_temp\nSET FusionLiveURL = 'https://us.fusion.live/servlet/Document?...'\nWHERE ISNULL(PM_Status, '') != 'Pre-register';\n\f0\fs22
+\par
+The URL includes the same document ID as both vid and selectedItemId.\par
+\par
+\b 16. Moving deleted records to trash\b0\par
+Deleted temporary rows are inserted into raw_fusionLive_documents_metadata_trash. The INSERT includes the document metadata and all extracted attributes. A NOT EXISTS condition prevents the same workspace/document ID from being inserted repeatedly.\par
+\f1\fs20
+WHERE t.isDeleted = 1\n  AND NOT EXISTS\n      (SELECT 1\n       FROM dbo.raw_fusionLive_documents_metadata_trash s\n       WHERE s.WorkSpaceId = t.WorkSpaceId\n         AND s.id = t.id);\n\f0\fs22
+\par
+After the trash insert, active rows in the production metadata table that correspond to deleted temporary rows are removed.\par
+\par
+\b 17. Replacing active metadata rows\b0\par
+The procedure deletes existing production metadata rows for temporary records with isDeleted = 0, then inserts the current temporary rows. This is effectively a replace operation for the workspace records being processed.\par
+\par
+The INSERT maps a large column list explicitly. This protects the procedure from depending on table column order, but it means every schema change must be reviewed in both the INSERT column list and SELECT list.\par
+\par
+Titles are normalized during insertion with:\par
+\f1\fs20
+REPLACE(t.title, '&amp;', 'and')\n\f0\fs22
+\par
+Therefore, the production table receives and instead of the literal XML entity &amp; in titles.\par
+\par
+\b 18. ProjectNumber assignment\b0\par
+ProjectNumber assignment is the most manually maintained section. It begins with workspace 16263 and continues through many ELSE IF branches. Each branch updates all production metadata rows for the current workspace using a CASE expression based on FolderName.\par
+\f1\fs20
+IF @WorkSpaceId = 16756\nBEGIN\n    UPDATE dbo.raw_fusionLive_documents_metadata\n    SET ProjectNumber = CASE\n        WHEN FolderName LIKE '/10715.410%' THEN '10715.410'\n        WHEN FolderName LIKE '/10715.500%' THEN '10715.500'\n        ELSE NULL\n    END\n    WHERE WorkSpaceId = @WorkSpaceId;\nEND\n\f0\fs22
+\par
+CASE evaluates WHEN branches from top to bottom. The first matching branch wins. If no branch matches, ELSE NULL clears ProjectNumber for that workspace row. This is an important behavior: adding or changing mappings can change existing assignments, including setting unmatched rows to NULL.\par
+\par
+The current patterns are not completely uniform. Some begin with /, some include a leading wildcard, and some identify descriptive folder names rather than project numbers. Examples include /10715.500%, %/11525.200%, /MP-42-L Air%, and /01 - Drawing Management/AOT%. Do not normalize these patterns blindly without comparing results.\par
+\par
+Workspace 16263 is a special case because its CASE expression uses ELSE '10292.200' rather than ELSE NULL. That means every unmatched row in that workspace receives 10292.200. Any replacement design must preserve or deliberately change this default.\par
+\par
+If a workspace does not have a hard-coded branch, the final ELSE block joins to dim_rpt_project and fills ProjectNumber only where it is still NULL.\par
+\f1\fs20
+UPDATE f\nSET f.ProjectNumber = p.ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata f\nINNER JOIN dbo.dim_rpt_project p\n    ON f.WorkSpaceId = p.WorkSpaceId\nWHERE f.WorkSpaceId = @WorkSpaceId\n  AND f.ProjectNumber IS NULL;\n\f0\fs22
+\par
+\b 19. Refresh logging\b0\par
+The final active operation inserts a row into fusionLive_metadata_refresh_log. It records the workspace, current timestamp, a status string, and the count of distinct FLIDs found in fl_raw_export_table.\par
+\f1\fs20
+INSERT INTO dbo.fusionLive_metadata_refresh_log\n    (WorkSpaceId, RefreshTime, [Status], RecordsCount)\nSELECT @WorkSpaceId, CURRENT_TIMESTAMP, 'Sccusseful', COUNT(DISTINCT FLID)\nFROM dbo.fl_raw_export_table;\n\f0\fs22
+\par
+The status text is currently spelled Sccusseful. Downstream consumers may depend on that exact value, so correct it only after checking dependencies.\par
+\par
+\b 20. Commented diagnostic SQL\b0\par
+The large comment block at the end contains manual troubleshooting and repair queries. These queries are not executed as part of the procedure. They include:\par
+- Checking temporary, active, and trash metadata.\par
+- Searching for ProjectNumber IS NULL.\par
+- Inspecting raw staging rows and FLID values.\par
+- Finding titles containing &amp;.\par
+- Reviewing specific workspaces and document references.\par
+- Moving or deleting special Trash Compactor rows.\par
+\par
+Because these statements are inside a block comment, they are useful as a runbook but have no effect during a normal procedure execution. Some are destructive DELETE or UPDATE statements and should never be run without a WHERE-clause review and a backup.\par
+\par
+\b 21. End-to-end data flow\b0\par
+The current process can be summarized as:\par
+1. Receive WorkSpaceId and XML export path.\par
+2. Calculate the prior update timestamp.\par
+3. Bulk-load the file into fl_raw_export_emp.\par
+4. Filter wrapper rows into fl_raw_export_table.\par
+5. Extract document IDs and normalize header attributes.\par
+6. Clean multiline Vendor Reference Number values.\par
+7. Propagate FLID to all child rows.\par
+8. Parse document headers into raw_fusionLive_documents_metadata_temp.\par
+9. Attach folders, categories, and file details.\par
+10. Extract document attributes.\par
+11. Mark trash folders as deleted, with the Trash Compactor exception.\par
+12. Build FusionLive URLs.\par
+13. Insert deleted rows into the trash table.\par
+14. Remove deleted and replaced active rows from the production table.\par
+15. Insert current active metadata.\par
+16. Assign ProjectNumber through hard-coded CASE mappings or dim_rpt_project fallback.\par
+17. Write the refresh log entry.\par
+\par
+\b 22. Operational risks and maintenance points\b0\par
+\b Shared staging tables:\b0 The procedure truncates shared staging tables. Concurrent executions can overwrite each other. Coordinate executions or redesign the staging tables to include a run identifier.\par
+\b Dynamic BULK INSERT:\b0 The file path is concatenated into dynamic SQL. Restrict paths to trusted locations and validate caller input.\par
+\b Text parsing:\b0 The parser depends on XML attribute names, delimiters, and expected ordering. A FusionLive export format change can cause incorrect values or conversion errors.\par
+\b Cursors:\b0 Several cursors process rows one at a time. They are understandable but can be slow for large exports. Set-based parsing or SQL Server XML methods would generally be easier to scale and validate.\par
+\b Full workspace replacement:\b0 Existing active rows are deleted and reinserted for the workspace. A failed run after deletion can leave the workspace incomplete unless the procedure is wrapped in a transaction or the process has recovery procedures.\par
+\b CASE defaults:\b0 ELSE NULL clears unmatched projects in most workspaces, while workspace 16263 defaults to 10292.200. These behaviors must be preserved during any refactor.\par
+\b Schema coupling:\b0 The long INSERT lists must stay synchronized with table schema changes.\par
+\b Logging typo:\b0 The status value Sccusseful appears misspelled. Check consumers before changing it.\par
+\par
+\b 23. Useful investigation queries\b0\par
+Find records without project assignments:\par
+\f1\fs20
+SELECT *\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE ProjectNumber IS NULL;\n\f0\fs22
+\par
+Inspect one workspace:\par
+\f1\fs20
+SELECT *\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756;\n\f0\fs22
+\par
+Inspect folder patterns around a project:\par
+\f1\fs20
+SELECT DISTINCT WorkSpaceId, FolderName, ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE FolderName LIKE '%10715.500%'\nORDER BY WorkSpaceId, FolderName;\n\f0\fs22
+\par
+Review recent refresh attempts:\par
+\f1\fs20
+SELECT *\nFROM dbo.fusionLive_metadata_refresh_log\nORDER BY RefreshTime DESC;\n\f0\fs22
+\par
+Inspect raw export rows for a document:\par
+\f1\fs20
+SELECT *\nFROM dbo.fl_raw_export_table\nWHERE FLID = 10415129\nORDER BY TransId;\n\f0\fs22
+\par
+\b 24. How the future mapping-table process relates to this code\b0\par
+The current procedure is the authoritative description of the existing production behavior. The test procedure created separately replaces only the ProjectNumber assignment section with a lookup against FusionLiveProjectMapping_test. The XML parsing, attribute extraction, deletion handling, metadata replacement, URL construction, and logging remain conceptually the same.\par
+\par
+This separation is useful because it allows the mapping behavior to be tested without changing the production procedure. After test results are approved, the same table-driven section can be introduced into production under controlled change management.\par
+\par
+\b Final summary\b0\par
+This procedure is an ETL-style loader built around ordered text staging. It converts a FusionLive XML export into document metadata by carrying a document ID through related rows, parsing fields with delimiter-based string operations, updating attributes one at a time, replacing workspace metadata, and assigning project numbers from a large hard-coded mapping section. The most important maintenance boundary is the ProjectNumber assignment block; the rest of the procedure prepares and stores the metadata that block evaluates.\par
+}

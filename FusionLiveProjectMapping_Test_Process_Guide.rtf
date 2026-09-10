@@ -1,0 +1,173 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Calibri;}{\f1 Consolas;}}
+\paperw12240\paperh15840\margl1080\margr1080\margt900\margb900
+\fs22
+\b\fs34 FusionLive Project Mapping Test Process\b0\fs22\par
+\i Detailed implementation and operating guide\i0\par
+\par
+\b Purpose\b0\par
+This guide explains how to test the table-driven FusionLive project mapping process without changing the current production procedure. The test process uses objects ending in _test and keeps the existing hard-coded production procedure available as a fallback.\par
+\par
+\b What the new process changes\b0\par
+The current procedure contains a long IF / ELSE IF chain that assigns ProjectNumber from WorkSpaceId and FolderName. The test procedure reads those rules from dbo.FusionLiveProjectMapping_test instead. Future project additions become table inserts rather than procedure edits.\par
+\par
+\b Important safety rule\b0\par
+Do not deploy the test procedure over the production procedure. The test procedure has a different name and should be executed explicitly until the results have been reviewed and approved.\par
+\par
+\b 1. Review the files\b0\par
+The workspace contains these relevant files:\par
+\b FusionLiveProjectMapping_test.sql\b0 - Creates the test mapping table.\par
+\b FusionLiveProjectMapping_seed_test.sql\b0 - Loads the existing mappings into the test table.\par
+\b raw_loading_documents_metadata_upd_test.sql\b0 - Creates the test stored procedure.\par
+\b Export-FusionLiveProjectMappings.ps1\b0 - Regenerates a mapping seed script from the legacy procedure.\par
+\b raw_loading_documents_metadata_upd.sql\b0 - The current production procedure. Leave this unchanged during testing.\par
+\par
+\b 2. Back up the current database objects\b0\par
+Before testing, save the current procedure definition and record the current row counts. Run the following in SQL Server Management Studio against FLDataMart:\par
+\f1\fs20
+SELECT OBJECT_DEFINITION(OBJECT_ID(N'dbo.raw_loading_documents_metadata')) AS ProcedureDefinition;\par
+SELECT COUNT(*) AS CurrentMetadataRows\par
+FROM dbo.raw_fusionLive_documents_metadata;\par
+\f0\fs22
+\par
+Save the procedure definition and query results with the test evidence. This gives you a comparison point if the test results differ.\par
+\par
+\b 3. Create the test mapping table\b0\par
+Open FusionLiveProjectMapping_test.sql in SSMS. Confirm the database context is FLDataMart, then execute the script. It is idempotent: the table is created only when it does not already exist.\par
+\f1\fs20
+USE [FLDataMart]\nGO\n\nIF OBJECT_ID(N'dbo.FusionLiveProjectMapping_test', N'U') IS NULL\nBEGIN\n    CREATE TABLE dbo.FusionLiveProjectMapping_test\n    (\n        WorkSpaceId INT NOT NULL,\n        FolderPattern VARCHAR(500) NOT NULL,\n        ProjectNumber VARCHAR(100) NOT NULL,\n        IsActive BIT NOT NULL DEFAULT (1),\n        CreatedDate DATETIME2(0) NOT NULL DEFAULT (SYSUTCDATETIME()),\n        CONSTRAINT PK_FusionLiveProjectMapping_test\n            PRIMARY KEY (WorkSpaceId, FolderPattern)\n    );\nEND\nGO\n\f0\fs22
+\par
+Verify creation:\par
+\f1\fs20
+SELECT OBJECT_ID(N'dbo.FusionLiveProjectMapping_test', N'U') AS TestTableObjectId;\n\nSELECT COUNT(*) AS MappingRows\nFROM dbo.FusionLiveProjectMapping_test;\n\f0\fs22
+\par
+The first query should return a non-null object ID. The row count may be zero until the seed script is run.\par
+\par
+\b 4. Load the existing mappings\b0\par
+Execute FusionLiveProjectMapping_seed_test.sql. This script uses MERGE so it can be rerun without creating duplicate rows. It loads the current workspace rules, including the legacy default mapping for workspace 16263.\par
+\f1\fs20
+MERGE dbo.FusionLiveProjectMapping_test AS target\nUSING (VALUES\n    (16756, '/10715.500%', '10715.500')\n) AS source (WorkSpaceId, FolderPattern, ProjectNumber)\nON target.WorkSpaceId = source.WorkSpaceId\nAND target.FolderPattern = source.FolderPattern\nWHEN MATCHED THEN\n    UPDATE SET ProjectNumber = source.ProjectNumber, IsActive = 1\nWHEN NOT MATCHED THEN\n    INSERT (WorkSpaceId, FolderPattern, ProjectNumber)\n    VALUES (source.WorkSpaceId, source.FolderPattern, source.ProjectNumber);\nGO\n\f0\fs22
+\par
+The actual seed script contains all exported mappings. Verify the load:\par
+\f1\fs20
+SELECT COUNT(*) AS MappingRows\nFROM dbo.FusionLiveProjectMapping_test;\n\nSELECT *\nFROM dbo.FusionLiveProjectMapping_test\nWHERE WorkSpaceId = 16756\nORDER BY ProjectNumber;\n\f0\fs22
+\par
+Expected result: the table should contain the exported mapping set. The workspace 16756 results should include 10715.500 and the other existing project mappings.\par
+\par
+\b 5. Deploy the test procedure\b0\par
+Execute raw_loading_documents_metadata_upd_test.sql. The script creates or alters only dbo.raw_loading_documents_metadata_upd_test. It does not alter dbo.raw_loading_documents_metadata_upd.\par
+\f1\fs20
+CREATE OR ALTER PROCEDURE dbo.raw_loading_documents_metadata_upd_test\n    (@WorkSpaceId INT, @FilePath VARCHAR(200))\nAS\n-- The body is the same XML loading process, but the project assignment\n-- reads dbo.FusionLiveProjectMapping_test.\n\f0\fs22
+\par
+Verify the test procedure references the test table:\par
+\f1\fs20
+SELECT OBJECT_DEFINITION(OBJECT_ID(N'dbo.raw_loading_documents_metadata_upd_test'))\n    AS TestProcedureDefinition;\n\f0\fs22
+\par
+Search the returned definition for dbo.FusionLiveProjectMapping_test. Also confirm that the production procedure definition still contains its original hard-coded mapping logic.\par
+\par
+\b 6. Understand the test procedure's assignment logic\b0\par
+After the XML is parsed and metadata is loaded, the test procedure applies mappings with a set-based update:\par
+\f1\fs20
+-- Apply the explicit WorkSpaceId and FolderName mappings.\nUPDATE f\nSET f.ProjectNumber = m.ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata f\nINNER JOIN dbo.FusionLiveProjectMapping_test m\n    ON m.WorkSpaceId = f.WorkSpaceId\n   AND m.IsActive = 1\n   AND f.FolderName LIKE m.FolderPattern\nWHERE f.WorkSpaceId = @WorkSpaceId;\n\n-- Preserve the existing dimension-table fallback for rows still unmapped.\nUPDATE f\nSET f.ProjectNumber = p.ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata f\nINNER JOIN dbo.dim_rpt_project p\n    ON f.WorkSpaceId = p.WorkSpaceId\nWHERE f.WorkSpaceId = @WorkSpaceId\n  AND f.ProjectNumber IS NULL;\n\f0\fs22
+\par
+FolderPattern stores the complete SQL LIKE pattern. For normal project numbers, use a pattern such as %10715.500%. This is intentionally broader than the older /10715.500% pattern and will match the unique project number anywhere in FolderName. Special descriptive-folder rules can still be stored when needed.\par
+\par
+\b 7. Run a controlled test\b0\par
+Use a copy of the XML input file or a known input that can be safely reprocessed. Execute the test procedure explicitly:\par
+\f1\fs20
+EXEC dbo.raw_loading_documents_metadata_upd_test\n    @WorkSpaceId = 16756,\n    @FilePath = '\\\\IMSQL19.EDG.NET\\SourceData\\FusionLive\\16756.txt';\n\f0\fs22
+\par
+Important: the procedure uses shared staging tables such as fl_raw_export_emp, fl_raw_export_table, and raw_fusionLive_documents_metadata_temp. Do not run the test procedure concurrently with the production procedure unless your operational design explicitly supports that.\par
+\par
+\b 8. Validate the test result\b0\par
+Run these queries immediately after the test execution:\par
+\f1\fs20
+SELECT WorkSpaceId, ProjectNumber, COUNT(*) AS RecordCount\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\nGROUP BY WorkSpaceId, ProjectNumber\nORDER BY ProjectNumber;\n\nSELECT id, FolderName, ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\n  AND FolderName LIKE '%10715.500%'\nORDER BY id;\n\nSELECT id, FolderName, ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\n  AND ProjectNumber IS NULL;\n\f0\fs22
+\par
+Confirm that folders containing 10715.500 receive ProjectNumber 10715.500. Review any remaining NULL values rather than assuming they are errors; some folders may intentionally have no project mapping.\par
+\par
+\b 9. Add a new project mapping\b0\par
+For a new project whose number is unique in FolderName, insert one row. Do not edit raw_loading_documents_metadata_upd_test.sql.\par
+\f1\fs20
+-- Add a project to an existing test workspace.\nINSERT INTO dbo.FusionLiveProjectMapping_test\n    (WorkSpaceId, FolderPattern, ProjectNumber)\nVALUES\n    (16756, '%10715.600%', '10715.600');\n\f0\fs22
+\par
+For a new workspace, use the same process. No new IF block is required:\par
+\f1\fs20
+-- Add a new workspace and its first project.\nINSERT INTO dbo.FusionLiveProjectMapping_test\n    (WorkSpaceId, FolderPattern, ProjectNumber)\nVALUES\n    (12345, '%1234.001%', '1234.001');\n\f0\fs22
+\par
+If the folder uses a descriptive name instead of the project number, store that pattern instead:\par
+\f1\fs20
+-- Use this only when the project number is not present in FolderName.\nINSERT INTO dbo.FusionLiveProjectMapping_test\n    (WorkSpaceId, FolderPattern, ProjectNumber)\nVALUES\n    (12345, '%Special Drawing Management%', '1234.001');\n\f0\fs22
+\par
+\b 10. Validate a new mapping before running the procedure\b0\par
+Check that the workspace and project do not already exist, then test the pattern against current data:\par
+\f1\fs20
+SELECT *\nFROM dbo.FusionLiveProjectMapping_test\nWHERE WorkSpaceId = 16756\n  AND ProjectNumber = '10715.600';\n\nSELECT DISTINCT WorkSpaceId, FolderName\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\n  AND FolderName LIKE '%10715.600%';\n\f0\fs22
+\par
+After the procedure runs, confirm the assignment:\par
+\f1\fs20
+SELECT DISTINCT ProjectNumber\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\n  AND FolderName LIKE '%10715.600%';\n\f0\fs22
+\par
+The expected result is one ProjectNumber value: 10715.600. If more than one mapping row matches the same folder, resolve the overlap before relying on the result.\par
+\par
+\b 11. Keep mappings active or inactive\b0\par
+Set IsActive to 0 when a mapping should be retained for history but temporarily excluded:\par
+\f1\fs20
+UPDATE dbo.FusionLiveProjectMapping_test\nSET IsActive = 0\nWHERE WorkSpaceId = 16756\n  AND ProjectNumber = '10715.600';\n\n-- Re-enable the mapping later.\nUPDATE dbo.FusionLiveProjectMapping_test\nSET IsActive = 1\nWHERE WorkSpaceId = 16756\n  AND ProjectNumber = '10715.600';\n\f0\fs22
+\par
+This is safer than deleting the row because the mapping history remains available.\par
+\par
+\b 12. Regenerate the seed script when the legacy procedure changes\b0\par
+The PowerShell helper can export the current hard-coded rules into a new SQL seed file. Use this only while migrating or comparing the old and new processes:\par
+\f1\fs20
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass\n\n.\\Export-FusionLiveProjectMappings.ps1 `\n    -ProcedurePath .\\raw_loading_documents_metadata_upd.sql `\n    -OutputPath .\\FusionLiveProjectMapping_seed_test.sql\n\f0\fs22
+\par
+The helper parses WHEN FolderName LIKE rules and preserves a literal CASE default as a catch-all pattern %. Review the generated SQL before executing it. Do not run the generated seed against the production table unless that is an intentional migration step.\par
+\par
+\b 13. PowerShell automation pattern\b0\par
+Your existing PowerShell process can insert approved mappings using parameterized SQL. The following example shows the intended flow. Replace the connection details with your approved configuration:\par
+\f1\fs20
+# The project number is unique, so the normal pattern matches it anywhere in FolderName.\n$workspaceId = 16756\n$projectNumber = '10715.600'\n$folderPattern = '%' + $projectNumber + '%'\n\n# Before inserting, check for an existing mapping.\n$checkSql = @'\nSELECT COUNT(*)\nFROM dbo.FusionLiveProjectMapping_test\nWHERE WorkSpaceId = @WorkSpaceId\n  AND ProjectNumber = @ProjectNumber;\n'@\n\n# Insert only after the project has passed your review or validation step.\n$insertSql = @'\nINSERT INTO dbo.FusionLiveProjectMapping_test\n    (WorkSpaceId, FolderPattern, ProjectNumber)\nVALUES\n    (@WorkSpaceId, @FolderPattern, @ProjectNumber);\n'@\n\f0\fs22
+\par
+Use SqlClient parameters rather than concatenating values into SQL. Parameterization prevents quote problems and avoids accidental SQL injection if folder values originate from XML.\par
+\par
+\b 14. Compare test and production results\b0\par
+For a selected workspace, compare counts by ProjectNumber between the production run and test run. Use separate databases or separate output tables if possible. If both procedures must use the same metadata table, run them sequentially and capture results after each run.\par
+\f1\fs20
+SELECT ProjectNumber, COUNT(*) AS RecordCount\nFROM dbo.raw_fusionLive_documents_metadata\nWHERE WorkSpaceId = 16756\nGROUP BY ProjectNumber\nORDER BY ProjectNumber;\n\f0\fs22
+\par
+Compare:\par
+1. Total record count.\par
+2. Count by ProjectNumber.\par
+3. Rows with NULL ProjectNumber.\par
+4. Rows assigned to the newly added project.\par
+5. Refresh log status and RecordsCount.\par
+\par
+\b 15. Promote the process after approval\b0\par
+Do not promote until the test results match the production results for representative workspaces and new mappings behave correctly. The promotion sequence is:\par
+1. Review and approve the mapping table design.\par
+2. Back up the production procedure and mapping values.\par
+3. Create the production mapping table without the _test suffix.\par
+4. Load the approved production seed data.\par
+5. Deploy the table-driven production procedure using CREATE OR ALTER.\par
+6. Run a controlled workspace and compare results.\par
+7. Update PowerShell to write approved mappings to the production mapping table.\par
+8. Retain the old procedure script for rollback and audit history.\par
+\par
+\b 16. Rollback plan\b0\par
+If the test process produces incorrect assignments, disable only the problematic test mapping:\par
+\f1\fs20
+UPDATE dbo.FusionLiveProjectMapping_test\nSET IsActive = 0\nWHERE WorkSpaceId = 12345\n  AND FolderPattern = '%1234.001%';\n\f0\fs22
+\par
+The current production process remains available because the production procedure was not changed. Stop executing the test procedure, correct the mapping table, and rerun the test with controlled input.\par
+\par
+\b Troubleshooting checklist\b0\par
+If ProjectNumber is NULL, verify the WorkSpaceId, FolderName, active flag, and exact LIKE pattern.\par
+If the wrong project is assigned, search for overlapping active patterns for that workspace.\par
+If a new workspace is not assigned, verify that a row exists; no procedure block is required.\par
+If the procedure fails at startup, confirm that FusionLiveProjectMapping_test exists in FLDataMart and that the executing login has SELECT permission.\par
+If test and production interfere with each other, check for concurrent use of shared staging tables.\par
+\par
+\b Final operating model\b0\par
+The ongoing workflow should be: XML process discovers a new project, PowerShell reports it, an operator validates it, one mapping row is inserted into the table, and the same stored procedure is reused. Workspace-specific CASE blocks and procedure edits are no longer needed in the test process.\par
+}
