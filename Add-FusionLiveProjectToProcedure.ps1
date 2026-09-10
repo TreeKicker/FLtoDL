@@ -1,31 +1,16 @@
-[CmdletBinding(SupportsShouldProcess)]
-# Supports -WhatIf and -Confirm so a caller can preview or approve the edit.
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$ProcedurePath,
-
-    [Parameter(Mandatory = $true)]
-    [int]$WorkSpaceId,
-
-    [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[^%_\[\]]+$')]
-    [string]$ProjectNumber,
-
-    [string]$FolderPattern,
-
-    [string]$BackupPath,
-
-    [string]$ServerInstance,
-
-    [string]$Database = 'FLDataMart',
-
-    [switch]$ApplyToDatabase,
-
-    [switch]$SyncWithDatabase
-)
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Edit these values before running the script.
+$ProcedurePath = Join-Path $PSScriptRoot 'raw_loading_documents_metadata_upd.sql'
+[int]$WorkSpaceId = 16756
+$ProjectNumber = '10715.600'
+$FolderPattern = ''
+$BackupPath = ''
+$ServerInstance = ''
+$Database = 'FLDataMart'
+$ApplyToDatabase = $false
+$SyncWithDatabase = $false
 
 # Fail before reading or writing anything if the target is not a real file.
 if (-not (Test-Path -LiteralPath $ProcedurePath -PathType Leaf)) {
@@ -137,7 +122,7 @@ function Complete-ProcedureUpdate {
         Copy-Item -LiteralPath $resolvedProcedurePath -Destination $BackupPath -Force
         Set-Content -LiteralPath $resolvedProcedurePath -Value $EditedLines -Encoding ASCII
 
-        if ($ApplyToDatabase -and $PSCmdlet.ShouldProcess("$ServerInstance/$Database", 'Alter the stored procedure in SQL Server')) {
+        if ($ApplyToDatabase) {
             Publish-ProcedureToDatabase -SqlFilePath $resolvedProcedurePath -TargetServer $ServerInstance -TargetDatabase $Database
         }
     }
@@ -241,12 +226,10 @@ if ($existingHeader) {
     }
 
     $newLine = "${whenIndent}WHEN FolderName LIKE '$FolderPattern' THEN '$ProjectNumber'"
-    if ($PSCmdlet.ShouldProcess($resolvedProcedurePath, "Add project $ProjectNumber to WorkSpaceId $WorkSpaceId")) {
-        $lines.Insert($caseElseIndex, $newLine)
-        Complete-ProcedureUpdate -EditedLines $lines
+    $lines.Insert($caseElseIndex, $newLine)
+    Complete-ProcedureUpdate -EditedLines $lines
 
-        Write-Output "Added WorkSpaceId $WorkSpaceId / ProjectNumber $ProjectNumber. Backup: $BackupPath"
-    }
+    Write-Output "Added WorkSpaceId $WorkSpaceId / ProjectNumber $ProjectNumber. Backup: $BackupPath"
     return
 }
 
@@ -286,11 +269,9 @@ $newSection = @(
     "`tEND"
 )
 
-if ($PSCmdlet.ShouldProcess($resolvedProcedurePath, "Add WorkSpaceId $WorkSpaceId with ProjectNumber $ProjectNumber")) {
-    for ($offset = 0; $offset -lt $newSection.Count; $offset++) {
-        $lines.Insert($fallbackElseIndex + $offset, $newSection[$offset])
-    }
-    Complete-ProcedureUpdate -EditedLines $lines
-
-    Write-Output "Added WorkSpaceId $WorkSpaceId with ProjectNumber $ProjectNumber. Backup: $BackupPath"
+for ($offset = 0; $offset -lt $newSection.Count; $offset++) {
+    $lines.Insert($fallbackElseIndex + $offset, $newSection[$offset])
 }
+Complete-ProcedureUpdate -EditedLines $lines
+
+Write-Output "Added WorkSpaceId $WorkSpaceId with ProjectNumber $ProjectNumber. Backup: $BackupPath"
